@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="" xml:lang="">
+  <head>
+    <title>Accelerating sequential Monte Carlo with surrogate likelihoods</title>
+    <meta charset="utf-8" />
+    <script src="libs/header-attrs-2.8/header-attrs.js"></script>
+    <link href="libs/remark-css-0.0.1/default.css" rel="stylesheet" />
+    <link href="libs/remark-css-0.0.1/default-fonts.css" rel="stylesheet" />
+    <link href="libs/remark-css-0.0.1/hygge.css" rel="stylesheet" />
+    <link rel="stylesheet" href="bon-qut-campus-title.css" type="text/css" />
+  </head>
+  <body>
+    <textarea id="source">
+class: center, middle, inverse, title-slide
+
+# Accelerating sequential Monte Carlo<br>with surrogate likelihoods
+## Joshua J Bon<br><br>ISBA 2021<br><br>
+### 
+### Queensland University of Technology <br>ARC Centre of Excellence for Mathematical and Statistical Frontiers<br>QUT Centre for Data Science
+
+---
+
+class: inverse, center, middle, hide-logo
+
+# How can a surrogate likelihood be exploited for computational gains in SMC? 
+
+      
+---
+class: list-space
+
+&lt;style&gt;
+
+.list-space li {
+padding: 0.25cm;
+}
+
+.list-nobullet li {
+  list-style-type:none;
+}
+
+&lt;/style&gt;
+
+
+
+
+## Talk outline
+
+1. Importance sampling to SMC
+2. Tuning delayed-acceptance in SMC
+3. Calibrating surrogate likelihoods in SMC
+4. Surrogate first annealing strategy
+5. Experiment results
+
+Joint work with **Anthony Lee** (Bristol University) and **Christopher Drovandi** (QUT)
+
+Slides available here: https://bonstats.github.io/isba-da-smc/
+
+---
+
+## Importance sampling
+
+Importance sampling is based on the identity:
+
+`$$\mathbb{E}_{p}[f(\boldsymbol{\theta})]
+= \mathbb{E}_{g}\left[f(\boldsymbol{\theta})\frac{p(\boldsymbol{\theta}~\vert~\boldsymbol{y})}{g(\boldsymbol{\theta})}\right]$$`
+
+--
+
+For which the Monte Carlo approximation is:
+
+`$$\mathbb{E}_{p}[f(\boldsymbol{\theta})] \approx \frac{1}{N}\sum_{i=1}^{N}f(\boldsymbol{\theta}_{i})\frac{ p(\boldsymbol{\theta}_{i}~\vert~\boldsymbol{y})}{g( \boldsymbol{\theta}_{i})}, \quad \boldsymbol{\theta}_{i} \sim g(\boldsymbol{\theta})$$`
+--
+
+The fundamental elements of importance sampling are
+.full-width[.content-box-red[
+`$$\begin{aligned}\text{Locations: }&amp; \qquad \boldsymbol{\theta}_{i} \sim g(\boldsymbol{\theta})\\
+\text{Weights: }&amp; \qquad  w_{i} = \frac{ p(\boldsymbol{\theta}_{i}~\vert~\boldsymbol{y})}{g( \boldsymbol{\theta}_{i})}
+\end{aligned}$$`
+]]
+
+---
+
+
+## Sequential Monte Carlo
+
+Hard to develop an importance distribution `\(g(\boldsymbol{\theta})\)`! 
+
+ 🌶 Take a series of smaller steps.
+
+--
+
+- Choose a schedule to connect a tractable starting distribution `\(p_{0}(\boldsymbol{\theta})\)` to the posterior `\(p_{T}(\boldsymbol{\theta}) = p(\boldsymbol{\theta}~\vert~\boldsymbol{y})\)`. For example
+
+`$$p_{t}(\boldsymbol{\theta}) = p_{0}(\boldsymbol{\theta})^{1-\gamma_{t}}p(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{\gamma_{t}} \quad t = 1, 2, \ldots, T$$`
+
+--
+
+- With temperature schedule:
+
+`$$0 = \gamma_{0} &lt; \gamma_{1} &lt; \cdots &lt; \gamma_{T-1} &lt; \gamma_{T} = 1$$`
+
+--
+
+- Draw a sample from starting distribution `\(p_{0}(\boldsymbol{\theta})\)` then iteratively reweight through sequence of distributions
+
+--
+
+.full-width[.content-box-red[**Problem**: The variance of the weights increases after each iteration]]
+
+---
+
+## Sequential Monte Carlo 
+
+To avoid particle degeneracy, after reweighting:
+
+--
+
+.full-width[.content-box-purple[
+🌶 **Resample**: Randomly select particles according to weight. 
+- Survival of the fittest.
+]]
+
+--
+
+.full-width[.content-box-red[
+🌶 **Refresh**: Mutate samples to avoid degeneracy in particles
+- Most often with MCMC kernels
+]]
+    
+---
+class: hide-logo
+
+Example SMC algorithm: Resample-move for static models
+&lt;img src="imgs/smc_algorithm.svg" width="650" style="display: block; margin: auto;" /&gt;
+
+---
+class: inverse, center, middle, hide-logo
+
+## Delayed-acceptance vs Metropolis-Hastings
+
+## (David vs Goliath)
+
+---
+class: list-space
+## Metropolis-Hastings
+
+To refresh (mutation) particles in SMC with a **Metropolis-Hastings** kernel:
+
+1. Propose new location for particle from proposal distribution
+2. Calculate acceptance rate
+3. Accept or reject proposal
+
+--
+
+.full-width[.content-box-red[
+**Computational cost per particle** `\(= L_F \times k\)`.
+
+- `\(L_F\)`, computational cost of evaluating full likelihood
+- `\(k\)`, number of cycles
+]]
+
+---
+class: middle, center
+
+What if `\(p(\boldsymbol{\theta}~\vert~\boldsymbol{y})\)` is expensive to calculate?
+
+&lt;img src="imgs/judy_time_ticking.gif" width="468" height="352" style="display: block; margin: auto;" /&gt;
+
+---
+class: list-space
+## Delayed-acceptance
+
+To refresh (mutation) particles in SMC with a **delayed-acceptance** kernel:
+
+1. Propose new location for particle from proposal distribution
+2. Calculate 1st stage acceptance rate based on **surrogate** likelihood/posterior
+3. Provisionally accept or reject proposal (1st stage rate)
+
+--
+4. If provisionally accepted, calculate 2nd stage acceptance rate based on **full** likelihood/posterior
+5. Accept or reject proposal (2nd stage rate)
+
+--
+
+.full-width[.content-box-red[
+**Expected computational cost per particle** `\(= (L_{S} +  \alpha^{(1)}L_{F}) \times k\)`.
+
+- `\(L_S\)`, computational cost of evaluating surrogate likelihood
+- `\(\alpha^{(1)}\)`, 1st stage acceptance rate
+]]
+
+---
+
+## Adaptive delayed-acceptance in SMC
+
+- The proposal distribution `\(q_{\phi}(\boldsymbol{\theta}^{\prime}~\vert~\boldsymbol{\theta})\)` has tuning parameters `\(\phi\)`.
+
+--
+
+- DA is most efficient when big steps are taken
+  - lots of rejections, but a few big accepted jumps
+
+--
+
+- SMC can use a stopping criterion to determine number of cycles in the mutation step
+  - i.e. a diversification criterion
+
+--
+
+.full-width[.content-box-red[
+**Idea**: Select kernel tuning parameters by minimising computation time such that a diversification criterion is met
+]]
+
+---
+
+## Optimising computation time
+
+Solve the following approximately
+
+`$$\arg \min_{\boldsymbol{\phi}} C(k,\boldsymbol{\phi})$$`
+`$$\text{such that } D(k,\boldsymbol{\phi}) &gt; d$$`
+`$$~$$`
+--
+
+**Expected computation time** of `\(k\)` delayed-acceptance cycles
+
+.full-width[.content-box-red[
+`$$C(k,\boldsymbol{\phi}) = k(L_{S} +  \alpha^{(1)}(\boldsymbol{\phi})L_{F})$$`
+]]
+
+- `\(L_{S}\)`: cost of surrogate likelihood 
+- `\(L_{F}\)`: cost of full likelihood
+- `\(\alpha^{(1)}(\phi)\)`: first stage acceptance for `\(\phi\)`
+
+---
+
+## Optimising computation time
+
+Solve the following approximately
+
+`$$\arg \min_{\boldsymbol{\phi}} C(k,\boldsymbol{\phi})$$`
+`$$\text{such that } D(k,\boldsymbol{\phi}) &gt; d$$`
+`$$~$$`
+--
+
+**Diversification criterion**: use median ESJD to determine number of cycles required 
+([Pasarica and Gelman, 2010;](www.jstor.org/stable/24308995) [Salomone et al, 2018](https://arxiv.org/abs/1805.03924)).
+
+.full-width[.content-box-red[
+`$$D(k,\boldsymbol{\phi}) = \text{median}\left\{\sum_{s=1}^{k} J_{s}(\boldsymbol{\phi}) \right\}$$`
+]]
+
+- `\(k\)`: Cycles of DA kernel
+- `\(J_{s}(\boldsymbol{\phi})\)`: ESJD in cycle `\(s\)` with parameter `\(\boldsymbol{\phi}\)`
+
+---
+
+## Procedure in practice 
+
+Fix a finite set of potential parameters, e.g. `\(\phi \in \{0.1, 0.5, 1.0\}\)` 
+
+--
+
+1. Run pilot mutation step to estimate:
+
+    - `\(\hat{L}_{S}\)`, `\(\hat{L}_{F}\)`, `\(\widehat{\alpha^{(1)}}(\phi)\)`, `\(\hat{J_{1}}(\phi)\)`
+    - Estimate `\(\hat{k}_{\phi}\)`: the minimum `\(k\)` for diversification using an approximate model of `\(D(k,\phi)\)` 
+--
+
+2. Find `\(\phi^{\star}\)` using estimates from pilot run
+
+    - `\(\phi^{\star} = \arg \min_{\phi} \hat{C}(\hat{k}_{\phi},\phi)\)`
+--
+
+3. Continue mutation steps until empirical diversification criterion threshold is met
+
+    - `\(\text{median}\left\{\sum_{s=1}^{k} \hat{J_{s}}(\phi^{\star}) \right\} &gt; d\)`
+
+---
+class: inverse, center, middle, hide-logo
+
+## Calibrating the surrogate likelihood
+
+---
+
+## Calibrating the surrogate likelihood
+
+.full-width[.content-box-red[
+**Key idea**: Use current location or location history of the particles to calibrate the surrogate likelihood (better match the full likelihood).
+]]
+
+--
+
+**1. Location-scale transformation**
+
+- Take `\(T_{\boldsymbol{\xi}}\)`, a pre-specified transformation with parameters `\(\boldsymbol{\xi}\)`
+
+--
+
+- Particle history: `\(H(L) = \{ (\boldsymbol{\theta}, L(\boldsymbol{y}~\vert~\boldsymbol{\theta})): L(\boldsymbol{y}~\vert~\boldsymbol{\theta}) \text{ has been evaluated at } \boldsymbol{\theta}\}.\)`
+
+--
+
+- Find `$$\boldsymbol{\xi}^{\star} = \min_{\boldsymbol{\xi}} \sum_{\boldsymbol{\theta} \in H(L)}d\left[ L(\boldsymbol{y}~\vert~\boldsymbol{\theta}), \tilde{L}(\boldsymbol{y}~\vert~T_{\boldsymbol{\xi}}(\boldsymbol{\theta}))\right]$$`
+
+--
+
+- `\(d\)` is some discrepancy measure, e.g. squared difference of the log-likelihoods
+
+--
+
+- Use a subset of the history, to reduce computational cost
+
+---
+exclude: false
+
+## Calibrating the surrogate likelihood
+
+**2. Weighted annealing**
+
+--
+
+For surrogate likelihoods that can be factorised
+
+- e.g. `\(\tilde{L}(\boldsymbol{y}~\vert~\boldsymbol{\theta}) = \prod_{i=1}^{n} \tilde{p}(y_{i}~\vert~\boldsymbol{\theta})\)`
+
+--
+
+- Let `\(\tilde{L}(\boldsymbol{y}~\vert~\boldsymbol{\theta},\boldsymbol{\omega}) = \prod_{i=1}^{n} \tilde{p}(y_{i}~\vert~\boldsymbol{\theta})^{\omega_{i}}\)`
+
+--
+
+-  Find `$$\boldsymbol{\omega}^{\star} = \min_{\boldsymbol{\omega}} \sum_{\boldsymbol{\theta} \in H(L)}d\left[ L(\boldsymbol{y}~\vert~\boldsymbol{\theta}), \tilde{L}(\boldsymbol{y}~\vert~\boldsymbol{\theta}, \boldsymbol{\omega})\right] + \lambda \Vert\boldsymbol{\omega}\Vert_{1}$$`
+
+--
+
+- If `\(d\)` is squared difference of the log-likelihoods, this is equivalent to the standard Lasso
+
+---
+class: inverse, center, middle, hide-logo
+
+## Surrogate first annealing
+
+---
+## Surrogate first annealing
+
+.full-width[.content-box-red[
+**Key idea**:
+Use two stages of annealing in SMC to eliminate unlikely particles early with low cost.
+]]
+
+--
+
+`$$p_{0}(\boldsymbol{\theta}) \rightarrow \tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{\lambda} \rightarrow p(\boldsymbol{\theta}~\vert~\boldsymbol{y}), \quad 0 &lt; \lambda \leq 1$$`
+
+--
+
+| `\(\gamma_{t}\qquad\)` | `\(p_{t}(\boldsymbol{\theta})\)` |
+|--------------------------------------|----------------|
+| 0.0 | `\(p_{0}(\boldsymbol{\theta})\)` |
+| 0.5 | `\(p_{0}(\boldsymbol{\theta})^{0.5}\tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{0.5\lambda}\)` |
+| 1.0 | `\(\tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{\lambda}\)` |
+| 1.5 | `\(\tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{0.5\lambda} p(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{0.5}\)` |
+|  2.0 | `\(p(\boldsymbol{\theta}~\vert~\boldsymbol{y})\)` |
+
+---
+class: list-space
+## Recap
+
+Three strategies used:
+
+1. Delayed-acceptance
+    - Tuned with pilot run of mutation step
+2. Surrogate likelihood calibration
+    - Uses history of particles
+3. Surrogate first annealing
+    - Surrogate posterior used as intermediate distribution
+
+---
+
+## Testing the strategies with simulations
+
+Run simulation to test optimisation framework
+
+- Number of particles: 1000 or 2000
+
+- Linear regression with `\(p = 5\)`
+
+- Full likelihood: Normal or student-t distribution df = 3 (with artificial delay)
+
+- Surrogate likelihood: Biased normal distribution
+
+- Ratio of full to surrogate cost: `\(\rho \in \{10^1,10^2,10^3,10^4,10^5,10^6\}\)`
+
+- Location-scale calibration using squared difference of surrogate and full log-likelihood (with regularisation)
+
+--
+
+**Test with combinations of SMC flavours**: 
+
+- DA = delayed-acceptance kernel
+- T = Transformation (surrogate calibration)
+- SFA = Surrogate first annealing
+
+---
+class: list-space
+
+## Overview of Results
+
+- DA+T+SFA had the best *computation* time improvements
+   - speeding up SMC by `\(2.9\times\)` to `\(8.8\times\)` compared to standard SMC. 
+   - better improvements for larger `\(\rho\)`
+
+--
+- DA+T+SFA had the best *efficiency* gains also 
+   - SE `\(\times\)` SLE: gains of `\(1.6\times\)` to `\(7.6\times\)`
+   - SE `\(\times\)` time: gains of `\(3.0\times\)` to `\(8.8\times\)`
+   - better improvements for larger `\(\rho\)`
+
+--
+- "DA+T only" typically did better than "SFA only"
+
+--
+- DA+T+SFA has super-linear performance compared to "DA+T only" and "SFA only"
+
+---
+
+## Efficiency Results
+
+&lt;img src="plots/rel-time-efficiency-2000-2020-09-07.png" width="90%" /&gt;
+
+---
+
+## Posterior Comparisons
+
+&lt;img src="plots/beta-density-2000-1-2021-05-07.png" width="50%" /&gt;
+
+---
+class: list-space
+
+## Example on Whittle Likelihood
+
+- The Whittle likelihood is a computationally efficient likelihood approximation for time series models ([Whittle 1953](https://doi.org/10.1007/BF02590998))
+
+--
+
+
+- Constructed using (discrete) Fourier transforms to the frequency domain
+
+--
+
+
+- `\(3.9\times\)` to `\(5.8\times\)` speed-up across the 10 simulations (80% interval)
+
+--
+
+
+- Reduced computation time from `\(\approx\)` 20.5 hours to 4.5 hours
+
+---
+
+## Posterior Comparisons - Whittle
+
+&lt;img src="plots/whittle-phi2-2020-09-06.png" width="65%" /&gt;
+
+---
+class: list-space
+
+## Conclusions
+
+--
+
+- A generic framework for tuning mutation kernels in SMC
+
+    - Choosing optimal kernel tuning parameters and number of cycles
+    - Ensure sufficient particle diversification adaptively
+
+--
+
+- Explored uses of surrogate likelihoods in SMC
+
+    - Delayed-acceptance
+    - Surrogate first annealing
+
+--
+
+- Adaptively improves surrogate likelihoods
+
+    - With surrogate likelihood calibration
+
+---
+class: middle, center
+
+# Thank you for watching
+
+    </textarea>
+<style data-target="print-only">@media screen {.remark-slide-container{display:block;}.remark-slide-scaler{box-shadow:none;}}</style>
+<script src="https://remarkjs.com/downloads/remark-latest.min.js"></script>
+<script>var slideshow = remark.create({
+"slideNumberFormat": "%current%",
+"highlightStyle": "github",
+"highlightLines": true,
+"countIncrementalSlides": false,
+"ratio": "16:9"
+});
+if (window.HTMLWidgets) slideshow.on('afterShowSlide', function (slide) {
+  window.dispatchEvent(new Event('resize'));
+});
+(function(d) {
+  var s = d.createElement("style"), r = d.querySelector(".remark-slide-scaler");
+  if (!r) return;
+  s.type = "text/css"; s.innerHTML = "@page {size: " + r.style.width + " " + r.style.height +"; }";
+  d.head.appendChild(s);
+})(document);
+
+(function(d) {
+  var el = d.getElementsByClassName("remark-slides-area");
+  if (!el) return;
+  var slide, slides = slideshow.getSlides(), els = el[0].children;
+  for (var i = 1; i < slides.length; i++) {
+    slide = slides[i];
+    if (slide.properties.continued === "true" || slide.properties.count === "false") {
+      els[i - 1].className += ' has-continuation';
+    }
+  }
+  var s = d.createElement("style");
+  s.type = "text/css"; s.innerHTML = "@media print { .has-continuation { display: none; } }";
+  d.head.appendChild(s);
+})(document);
+// delete the temporary CSS (for displaying all slides initially) when the user
+// starts to view slides
+(function() {
+  var deleted = false;
+  slideshow.on('beforeShowSlide', function(slide) {
+    if (deleted) return;
+    var sheets = document.styleSheets, node;
+    for (var i = 0; i < sheets.length; i++) {
+      node = sheets[i].ownerNode;
+      if (node.dataset["target"] !== "print-only") continue;
+      node.parentNode.removeChild(node);
+    }
+    deleted = true;
+  });
+})();
+(function() {
+  "use strict"
+  // Replace <script> tags in slides area to make them executable
+  var scripts = document.querySelectorAll(
+    '.remark-slides-area .remark-slide-container script'
+  );
+  if (!scripts.length) return;
+  for (var i = 0; i < scripts.length; i++) {
+    var s = document.createElement('script');
+    var code = document.createTextNode(scripts[i].textContent);
+    s.appendChild(code);
+    var scriptAttrs = scripts[i].attributes;
+    for (var j = 0; j < scriptAttrs.length; j++) {
+      s.setAttribute(scriptAttrs[j].name, scriptAttrs[j].value);
+    }
+    scripts[i].parentElement.replaceChild(s, scripts[i]);
+  }
+})();
+(function() {
+  var links = document.getElementsByTagName('a');
+  for (var i = 0; i < links.length; i++) {
+    if (/^(https?:)?\/\//.test(links[i].getAttribute('href'))) {
+      links[i].target = '_blank';
+    }
+  }
+})();
+// adds .remark-code-has-line-highlighted class to <pre> parent elements
+// of code chunks containing highlighted lines with class .remark-code-line-highlighted
+(function(d) {
+  const hlines = d.querySelectorAll('.remark-code-line-highlighted');
+  const preParents = [];
+  const findPreParent = function(line, p = 0) {
+    if (p > 1) return null; // traverse up no further than grandparent
+    const el = line.parentElement;
+    return el.tagName === "PRE" ? el : findPreParent(el, ++p);
+  };
+
+  for (let line of hlines) {
+    let pre = findPreParent(line);
+    if (pre && !preParents.includes(pre)) preParents.push(pre);
+  }
+  preParents.forEach(p => p.classList.add("remark-code-has-line-highlighted"));
+})(document);</script>
+<style>
+.logo {
+  background-image: url(imgs/QUT_SQUARE_RGB_XLGE.png);
+  background-size: contain;
+  background-repeat: no-repeat;
+  position: absolute;
+  top: 1em;
+  right: 1em;
+  width: 100px;
+  height: 100px;
+  z-index: 0;
+}
+</style>
+
+<script>
+document
+  .querySelectorAll(
+    '.remark-slide-content' +
+    ':not(.title-slide)' +
+    // add additional classes to exclude here, e.g.
+    // ':not(.inverse)' +
+    ':not(.hide-logo)'
+  )
+  .forEach(el => {
+    el.innerHTML += '<div class="logo"></div>';
+  });
+</script>
+
+<script>
+slideshow._releaseMath = function(el) {
+  var i, text, code, codes = el.getElementsByTagName('code');
+  for (i = 0; i < codes.length;) {
+    code = codes[i];
+    if (code.parentNode.tagName !== 'PRE' && code.childElementCount === 0) {
+      text = code.textContent;
+      if (/^\\\((.|\s)+\\\)$/.test(text) || /^\\\[(.|\s)+\\\]$/.test(text) ||
+          /^\$\$(.|\s)+\$\$$/.test(text) ||
+          /^\\begin\{([^}]+)\}(.|\s)+\\end\{[^}]+\}$/.test(text)) {
+        code.outerHTML = code.innerHTML;  // remove <code></code>
+        continue;
+      }
+    }
+    i++;
+  }
+};
+slideshow._releaseMath(document);
+</script>
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+(function () {
+  var script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src  = 'https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-MML-AM_CHTML';
+  if (location.protocol !== 'file:' && /^https?:/.test(script.src))
+    script.src  = script.src.replace(/^https?:/, '');
+  document.getElementsByTagName('head')[0].appendChild(script);
+})();
+</script>
+  </body>
+</html>

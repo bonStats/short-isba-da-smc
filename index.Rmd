@@ -1,0 +1,658 @@
+---
+title: "Accelerating sequential Monte Carlo<br>with surrogate likelihoods"
+subtitle: "Joshua J Bon<br><br>ISBA 2021<br><br>"
+author: ""
+institute: ""
+date: "Queensland University of Technology <br>ARC Centre of Excellence for Mathematical and Statistical Frontiers<br>QUT Centre for Data Science"
+output:
+  xaringan::moon_reader:
+    css: ["default", "default-fonts", "hygge", "bon-qut-campus-title.css"] #css: ["default", "default-fonts", "hygge"] #
+    lib_dir: libs
+    nature:
+      slideNumberFormat: "%current%"
+      highlightStyle: github
+      highlightLines: true
+      countIncrementalSlides: false
+      ratio: "16:9"
+    includes:
+       after_body: insert-logo.html
+
+---
+class: inverse, center, middle, hide-logo
+
+# How can a surrogate likelihood be exploited for computational gains in SMC? 
+
+      
+---
+class: list-space
+
+<style>
+
+.list-space li {
+padding: 0.25cm;
+}
+
+.list-nobullet li {
+  list-style-type:none;
+}
+
+</style>
+
+
+```{r setup, load_refs, include=FALSE, cache=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(RColorBrewer)
+library(kableExtra)
+library(purrr)
+
+library(RefManageR)
+BibOptions(check.entries = FALSE,
+           bib.style = "authoryear",
+           cite.style = "authoryear",
+           style = "html",
+           hyperlink = FALSE,
+           dashed = FALSE)
+myBib <- ReadBib("biblio.bib", check = FALSE)
+
+#### Helpers ####
+capitalize <- function(string) {
+  substr(string, 1, 1) <- toupper(substr(string, 1, 1))
+  string
+}
+
+attach_name <- function(string, name){
+  paste(name, "=", capitalize(string))
+}
+
+label_alg <- Vectorize(function(x){
+  
+  switch(x,
+         smc_standard = "Standard",
+         smc_da =  "DA+T",
+         smc_da_no_trans = "DA",
+         smc_sfa_da = "DA+T+SFA",
+         smc_sfa_da_no_trans = "DA+SFA",
+         smc_sfa = "SFA",
+         smc_approx = "Approx"
+         )
+  
+})
+
+cr_label <- trans_format('log10', math_format(10^.x))
+
+parse_labels <- function(values) {
+  #values <- paste0("list(", values, ")")
+  values <- gsub("`","", values)
+  lapply(values, function(expr) c(parse(text = expr)))
+}
+
+flabeller <- labeller(likelihood = function(s) capitalize(s),
+                      bss_model = function(s) attach_name(s, "Tuning"),
+                      alg = function(s) label_alg(s),
+                      cost_ratio = label_parsed,
+                      iter_group = label_parsed,
+                      beta = label_parsed
+                      )
+
+scientific_10 <- function(x, remove_1_times = F) {
+  exp_text <- ifelse(x > 1,
+         gsub("e\\+", " %*% 10^", scales::scientific_format()(x)),
+         gsub("e", " %*% 10^", scales::scientific_format()(x))
+  )
+  
+  if(remove_1_times){
+    
+    exp_text <- gsub("1 %*% ", "", exp_text, fixed = T)
+    
+  }
+
+  parse(text = exp_text)
+  
+}
+
+algs_list_sort <- c("smc_standard", 
+                    "smc_da", "smc_da_no_trans", 
+                    "smc_sfa_da", "smc_sfa_da_no_trans", 
+                    "smc_sfa", "smc_approx")
+
+algs_list_names <- c("Standard", 
+                     "DA+T", "DA", 
+                     "DA+T+SFA", "DA+SFA", 
+                     "SFA", "Approx")
+
+facet_label_scientific_rho <- function(x, rv = T){
+  
+  levels <- unique(x)
+  labels <- ifelse(levels > 1,
+                   gsub("e\\+", " %*% 10^", scales::scientific_format()(levels)),
+                   gsub("e", " %*% 10^", scales::scientific_format()(levels))
+  )
+  
+  labels <- paste("rho ==", gsub("1 %*% ", "", labels, fixed = T))
+  
+  if(rv){
+    ordered(x, levels = rev(levels), labels = rev(labels))
+  } else {
+    ordered(x, levels = levels, labels = labels)
+  }
+}
+
+facet_label_gamma <-  function(x){
+  
+  levels <- c("(0,3]", "(3,6]", "(6,9]", "(9,Inf]")
+  new_labs <- c("group('{',list(1,2,3),'}')", 
+                "group('{',list(4,5,6),'}')", 
+                "group('{',list(7,8,ldots),'}')",
+                "group('{',list(7,8,ldots),'}')")
+  
+  labels <- paste("gamma ==", new_labs)
+  
+  ordered(x, 
+         levels = levels,
+         labels = labels
+  )
+  
+}
+
+knitr::opts_chunk$set(cache = T)
+
+# TODO: result of whittle, andrews comments
+
+```
+
+## Talk outline
+
+1. Importance sampling to SMC
+2. Tuning delayed-acceptance in SMC
+3. Calibrating surrogate likelihoods in SMC
+4. Surrogate first annealing strategy
+5. Experiment results
+
+Joint work with **Anthony Lee** (Bristol University) and **Christopher Drovandi** (QUT)
+
+Slides available here: https://bonstats.github.io/isba-da-smc/
+
+---
+
+## Importance sampling
+
+Importance sampling is based on the identity:
+
+$$\mathbb{E}_{p}[f(\boldsymbol{\theta})]
+= \mathbb{E}_{g}\left[f(\boldsymbol{\theta})\frac{p(\boldsymbol{\theta}~\vert~\boldsymbol{y})}{g(\boldsymbol{\theta})}\right]$$
+
+--
+
+For which the Monte Carlo approximation is:
+
+$$\mathbb{E}_{p}[f(\boldsymbol{\theta})] \approx \frac{1}{N}\sum_{i=1}^{N}f(\boldsymbol{\theta}_{i})\frac{ p(\boldsymbol{\theta}_{i}~\vert~\boldsymbol{y})}{g( \boldsymbol{\theta}_{i})}, \quad \boldsymbol{\theta}_{i} \sim g(\boldsymbol{\theta})$$
+--
+
+The fundamental elements of importance sampling are
+.full-width[.content-box-red[
+$$\begin{aligned}\text{Locations: }& \qquad \boldsymbol{\theta}_{i} \sim g(\boldsymbol{\theta})\\
+\text{Weights: }& \qquad  w_{i} = \frac{ p(\boldsymbol{\theta}_{i}~\vert~\boldsymbol{y})}{g( \boldsymbol{\theta}_{i})}
+\end{aligned}$$
+]]
+
+---
+
+
+## Sequential Monte Carlo
+
+Hard to develop an importance distribution $g(\boldsymbol{\theta})$! 
+
+ `r emo::ji("pepper")` Take a series of smaller steps.
+
+--
+
+- Choose a schedule to connect a tractable starting distribution $p_{0}(\boldsymbol{\theta})$ to the posterior $p_{T}(\boldsymbol{\theta}) = p(\boldsymbol{\theta}~\vert~\boldsymbol{y})$. For example
+
+$$p_{t}(\boldsymbol{\theta}) = p_{0}(\boldsymbol{\theta})^{1-\gamma_{t}}p(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{\gamma_{t}} \quad t = 1, 2, \ldots, T$$
+
+--
+
+- With temperature schedule:
+
+$$0 = \gamma_{0} < \gamma_{1} < \cdots < \gamma_{T-1} < \gamma_{T} = 1$$
+
+--
+
+- Draw a sample from starting distribution $p_{0}(\boldsymbol{\theta})$ then iteratively reweight through sequence of distributions
+
+--
+
+.full-width[.content-box-red[**Problem**: The variance of the weights increases after each iteration]]
+
+---
+
+## Sequential Monte Carlo 
+
+To avoid particle degeneracy, after reweighting:
+
+--
+
+.full-width[.content-box-purple[
+`r emo::ji("pepper")` **Resample**: Randomly select particles according to weight. 
+- Survival of the fittest.
+]]
+
+--
+
+.full-width[.content-box-red[
+`r emo::ji("pepper")` **Refresh**: Mutate samples to avoid degeneracy in particles
+- Most often with MCMC kernels
+]]
+    
+---
+class: hide-logo
+
+Example SMC algorithm: Resample-move for static models
+```{r smc-alg, echo=FALSE, eval=TRUE, fig.align='center', out.width= 650}
+knitr::include_graphics("imgs/smc_algorithm.svg")
+```
+
+---
+class: inverse, center, middle, hide-logo
+
+## Delayed-acceptance vs Metropolis-Hastings
+
+## (David vs Goliath)
+
+---
+class: list-space
+## Metropolis-Hastings
+
+To refresh (mutation) particles in SMC with a **Metropolis-Hastings** kernel:
+
+1. Propose new location for particle from proposal distribution
+2. Calculate acceptance rate
+3. Accept or reject proposal
+
+--
+
+.full-width[.content-box-red[
+**Computational cost per particle** $= L_F \times k$.
+
+- $L_F$, computational cost of evaluating full likelihood
+- $k$, number of cycles
+]]
+
+---
+class: middle, center
+
+What if $p(\boldsymbol{\theta}~\vert~\boldsymbol{y})$ is expensive to calculate?
+
+```{r waiting-judy, echo=FALSE, eval=TRUE, fig.align='center', out.width = 234*2, out.height = 176*2}
+knitr::include_graphics("imgs/judy_time_ticking.gif")
+```
+
+---
+class: list-space
+## Delayed-acceptance
+
+To refresh (mutation) particles in SMC with a **delayed-acceptance** kernel:
+
+1. Propose new location for particle from proposal distribution
+2. Calculate 1st stage acceptance rate based on **surrogate** likelihood/posterior
+3. Provisionally accept or reject proposal (1st stage rate)
+
+--
+4. If provisionally accepted, calculate 2nd stage acceptance rate based on **full** likelihood/posterior
+5. Accept or reject proposal (2nd stage rate)
+
+--
+
+.full-width[.content-box-red[
+**Expected computational cost per particle** $= (L_{S} +  \alpha^{(1)}L_{F}) \times k$.
+
+- $L_S$, computational cost of evaluating surrogate likelihood
+- $\alpha^{(1)}$, 1st stage acceptance rate
+]]
+
+---
+
+## Adaptive delayed-acceptance in SMC
+
+- The proposal distribution $q_{\phi}(\boldsymbol{\theta}^{\prime}~\vert~\boldsymbol{\theta})$ has tuning parameters $\phi$.
+
+--
+
+- DA is most efficient when big steps are taken
+  - lots of rejections, but a few big accepted jumps
+
+--
+
+- SMC can use a stopping criterion to determine number of cycles in the mutation step
+  - i.e. a diversification criterion
+
+--
+
+.full-width[.content-box-red[
+**Idea**: Select kernel tuning parameters by minimising computation time such that a diversification criterion is met
+]]
+
+---
+
+## Optimising computation time
+
+Solve the following approximately
+
+$$\arg \min_{\boldsymbol{\phi}} C(k,\boldsymbol{\phi})$$
+$$\text{such that } D(k,\boldsymbol{\phi}) > d$$
+$$~$$
+--
+
+**Expected computation time** of $k$ delayed-acceptance cycles
+
+.full-width[.content-box-red[
+$$C(k,\boldsymbol{\phi}) = k(L_{S} +  \alpha^{(1)}(\boldsymbol{\phi})L_{F})$$
+]]
+
+- $L_{S}$: cost of surrogate likelihood 
+- $L_{F}$: cost of full likelihood
+- $\alpha^{(1)}(\phi)$: first stage acceptance for $\phi$
+
+---
+
+## Optimising computation time
+
+Solve the following approximately
+
+$$\arg \min_{\boldsymbol{\phi}} C(k,\boldsymbol{\phi})$$
+$$\text{such that } D(k,\boldsymbol{\phi}) > d$$
+$$~$$
+--
+
+**Diversification criterion**: use median ESJD to determine number of cycles required 
+([Pasarica and Gelman, 2010;](www.jstor.org/stable/24308995) [Salomone et al, 2018](https://arxiv.org/abs/1805.03924)).
+
+.full-width[.content-box-red[
+$$D(k,\boldsymbol{\phi}) = \text{median}\left\{\sum_{s=1}^{k} J_{s}(\boldsymbol{\phi}) \right\}$$
+]]
+
+- $k$: Cycles of DA kernel
+- $J_{s}(\boldsymbol{\phi})$: ESJD in cycle $s$ with parameter $\boldsymbol{\phi}$
+
+---
+
+## Procedure in practice 
+
+Fix a finite set of potential parameters, e.g. $\phi \in \{0.1, 0.5, 1.0\}$ 
+
+--
+
+1. Run pilot mutation step to estimate:
+
+    - $\hat{L}_{S}$, $\hat{L}_{F}$, $\widehat{\alpha^{(1)}}(\phi)$, $\hat{J_{1}}(\phi)$
+    - Estimate $\hat{k}_{\phi}$: the minimum $k$ for diversification using an approximate model of $D(k,\phi)$ 
+--
+
+2. Find $\phi^{\star}$ using estimates from pilot run
+
+    - $\phi^{\star} = \arg \min_{\phi} \hat{C}(\hat{k}_{\phi},\phi)$
+--
+
+3. Continue mutation steps until empirical diversification criterion threshold is met
+
+    - $\text{median}\left\{\sum_{s=1}^{k} \hat{J_{s}}(\phi^{\star}) \right\} > d$
+
+---
+class: inverse, center, middle, hide-logo
+
+## Calibrating the surrogate likelihood
+
+---
+
+## Calibrating the surrogate likelihood
+
+.full-width[.content-box-red[
+**Key idea**: Use current location or location history of the particles to calibrate the surrogate likelihood (better match the full likelihood).
+]]
+
+--
+
+**1. Location-scale transformation**
+
+- Take $T_{\boldsymbol{\xi}}$, a pre-specified transformation with parameters $\boldsymbol{\xi}$
+
+--
+
+- Particle history: $H(L) = \{ (\boldsymbol{\theta}, L(\boldsymbol{y}~\vert~\boldsymbol{\theta})): L(\boldsymbol{y}~\vert~\boldsymbol{\theta}) \text{ has been evaluated at } \boldsymbol{\theta}\}.$
+
+--
+
+- Find $$\boldsymbol{\xi}^{\star} = \min_{\boldsymbol{\xi}} \sum_{\boldsymbol{\theta} \in H(L)}d\left[ L(\boldsymbol{y}~\vert~\boldsymbol{\theta}), \tilde{L}(\boldsymbol{y}~\vert~T_{\boldsymbol{\xi}}(\boldsymbol{\theta}))\right]$$
+
+--
+
+- $d$ is some discrepancy measure, e.g. squared difference of the log-likelihoods
+
+--
+
+- Use a subset of the history, to reduce computational cost
+
+---
+exclude: false
+
+## Calibrating the surrogate likelihood
+
+**2. Weighted annealing**
+
+--
+
+For surrogate likelihoods that can be factorised
+
+- e.g. $\tilde{L}(\boldsymbol{y}~\vert~\boldsymbol{\theta}) = \prod_{i=1}^{n} \tilde{p}(y_{i}~\vert~\boldsymbol{\theta})$
+
+--
+
+- Let $\tilde{L}(\boldsymbol{y}~\vert~\boldsymbol{\theta},\boldsymbol{\omega}) = \prod_{i=1}^{n} \tilde{p}(y_{i}~\vert~\boldsymbol{\theta})^{\omega_{i}}$
+
+--
+
+-  Find $$\boldsymbol{\omega}^{\star} = \min_{\boldsymbol{\omega}} \sum_{\boldsymbol{\theta} \in H(L)}d\left[ L(\boldsymbol{y}~\vert~\boldsymbol{\theta}), \tilde{L}(\boldsymbol{y}~\vert~\boldsymbol{\theta}, \boldsymbol{\omega})\right] + \lambda \Vert\boldsymbol{\omega}\Vert_{1}$$
+
+--
+
+- If $d$ is squared difference of the log-likelihoods, this is equivalent to the standard Lasso
+
+---
+class: inverse, center, middle, hide-logo
+
+## Surrogate first annealing
+
+---
+## Surrogate first annealing
+
+.full-width[.content-box-red[
+**Key idea**:
+Use two stages of annealing in SMC to eliminate unlikely particles early with low cost.
+]]
+
+--
+
+$$p_{0}(\boldsymbol{\theta}) \rightarrow \tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{\lambda} \rightarrow p(\boldsymbol{\theta}~\vert~\boldsymbol{y}), \quad 0 < \lambda \leq 1$$
+
+--
+
+| $\gamma_{t}\qquad$ | $p_{t}(\boldsymbol{\theta})$ |
+|--------------------------------------|----------------|
+| 0.0 | $p_{0}(\boldsymbol{\theta})$ |
+| 0.5 | $p_{0}(\boldsymbol{\theta})^{0.5}\tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{0.5\lambda}$ |
+| 1.0 | $\tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{\lambda}$ |
+| 1.5 | $\tilde{p}(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{0.5\lambda} p(\boldsymbol{\theta}~\vert~\boldsymbol{y})^{0.5}$ |
+|  2.0 | $p(\boldsymbol{\theta}~\vert~\boldsymbol{y})$ |
+
+---
+class: list-space
+## Recap
+
+Three strategies used:
+
+1. Delayed-acceptance
+    - Tuned with pilot run of mutation step
+2. Surrogate likelihood calibration
+    - Uses history of particles
+3. Surrogate first annealing
+    - Surrogate posterior used as intermediate distribution
+
+---
+
+## Testing the strategies with simulations
+
+Run simulation to test optimisation framework
+
+- Number of particles: 1000 or 2000
+
+- Linear regression with $p = 5$
+
+- Full likelihood: Normal or student-t distribution df = 3 (with artificial delay)
+
+- Surrogate likelihood: Biased normal distribution
+
+- Ratio of full to surrogate cost: $\rho \in \{10^1,10^2,10^3,10^4,10^5,10^6\}$
+
+- Location-scale calibration using squared difference of surrogate and full log-likelihood (with regularisation)
+
+--
+
+**Test with combinations of SMC flavours**: 
+
+- DA = delayed-acceptance kernel
+- T = Transformation (surrogate calibration)
+- SFA = Surrogate first annealing
+
+---
+class: list-space
+
+## Overview of Results
+
+- DA+T+SFA had the best *computation* time improvements
+   - speeding up SMC by $2.9\times$ to $8.8\times$ compared to standard SMC. 
+   - better improvements for larger $\rho$
+
+--
+- DA+T+SFA had the best *efficiency* gains also 
+   - SE $\times$ SLE: gains of $1.6\times$ to $7.6\times$
+   - SE $\times$ time: gains of $3.0\times$ to $8.8\times$
+   - better improvements for larger $\rho$
+
+--
+- "DA+T only" typically did better than "SFA only"
+
+--
+- DA+T+SFA has super-linear performance compared to "DA+T only" and "SFA only"
+
+---
+
+## Efficiency Results
+
+```{r sim-plot-eff, eval = T, echo = F, out.width='90%', }
+
+pdfcvt <- "plots/rel-time-efficiency-2000-2020-09-07"
+
+cvt <- F
+
+if(cvt){
+  
+  pdftools::pdf_convert(pdf = paste0(pdfcvt,".pdf"), format = "png", dpi = 72*3,
+                        filenames = paste0(pdfcvt,".png"))
+}
+
+knitr::include_graphics(paste0(pdfcvt,".png"))
+```
+
+---
+
+## Posterior Comparisons
+
+```{r sim-plot-post-comp, eval = T, echo = F, out.width='50%', }
+
+pdfcvt <- "plots/beta-density-2000-1-2021-05-07"
+
+cvt <- F
+
+if(cvt){
+  
+  pdftools::pdf_convert(pdf = paste0(pdfcvt,".pdf"), format = "png", dpi = 72*3,
+                        filenames = paste0(pdfcvt,".png"))
+}
+
+knitr::include_graphics(paste0(pdfcvt,".png"), )
+```
+
+---
+class: list-space
+
+## Example on Whittle Likelihood
+
+- The Whittle likelihood is a computationally efficient likelihood approximation for time series models ([Whittle 1953](https://doi.org/10.1007/BF02590998))
+
+--
+
+
+- Constructed using (discrete) Fourier transforms to the frequency domain
+
+--
+
+
+- $3.9\times$ to $5.8\times$ speed-up across the 10 simulations (80% interval)
+
+--
+
+
+- Reduced computation time from $\approx$ 20.5 hours to 4.5 hours
+
+---
+
+## Posterior Comparisons - Whittle
+
+```{r whittle-plot-post-comp, eval = T, echo = F, out.width='65%', }
+
+pdfcvt <- "plots/whittle-phi2-2020-09-06"
+
+cvt <- F
+
+if(cvt){
+  
+  pdftools::pdf_convert(pdf = paste0(pdfcvt,".pdf"), format = "png", dpi = 72*3,
+                        filenames = paste0(pdfcvt,".png"))
+}
+
+knitr::include_graphics(paste0(pdfcvt,".png"))
+```
+
+---
+class: list-space
+
+## Conclusions
+
+--
+
+- A generic framework for tuning mutation kernels in SMC
+
+    - Choosing optimal kernel tuning parameters and number of cycles
+    - Ensure sufficient particle diversification adaptively
+
+--
+
+- Explored uses of surrogate likelihoods in SMC
+
+    - Delayed-acceptance
+    - Surrogate first annealing
+
+--
+
+- Adaptively improves surrogate likelihoods
+
+    - With surrogate likelihood calibration
+
+---
+class: middle, center
+
+# Thank you for watching
+

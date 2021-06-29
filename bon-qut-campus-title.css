@@ -1,0 +1,28 @@
+.title-slide {
+  background-image: url(imgs/qut-campus.jpg);
+  background-size: cover;
+  text-shadow: 0 0 80px #333;
+  vertical-align: top !important; 
+  text-align: right !important;
+}
+
+.title-slide h1 {
+  color: #FFFFFF;
+}
+
+.title-slide h2 {
+  color: #b56363;
+}
+
+.title-slide h3 {
+  color: #013178;
+  background-color: #FFFFFF;
+  vertical-align: middle !important; 
+  text-align: center !important;
+  font-weight: bold;
+}
+
+
+.title-slide .remark-slide-number {
+  display: none;
+}
