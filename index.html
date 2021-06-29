@@ -157,21 +157,19 @@ class: list-space
 
 ## Overview of Results
 
-- Simulation study
+- **Simulation study**
    - speeding up SMC by `\(2.9\times\)` to `\(8.8\times\)` compared to standard SMC. 
    - better improvements for larger ratio of full to surrogate likelihood cost
+   - Using all innovations had super-linear performance compared to just one or two.
 
 --
-- Using all innovations had super-linear performance compared to just one or two.
-
---
-- Whittle likelihood example
+- **Whittle likelihood example**
   - `\(3.9\times\)` to `\(5.8\times\)` speed-up across the 10 simulations (80% interval)
   - Reduced computation time from `\(\approx\)` 20.5 hours to 4.5 hours
 
 ---
 
-## Posterior Comparisons - Whittle
+## SMC Posterior Comparisons - Whittle
 
 &lt;img src="plots/whittle-phi2-2020-09-06.png" width="65%" /&gt;
 
